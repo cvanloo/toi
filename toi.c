@@ -1,3 +1,5 @@
+#define PLATFORM_LINUX
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -5,15 +7,29 @@
 #include <string.h>
 #include <stdio.h>
 
+#ifdef PLATFORM_WIN32
+#define Rectangle W32Rectangle
+#include <windows.h>
+#undef Rectangle
+#endif
+
+#ifdef PLATFORM_LINUX
+#define Window X11Window
+#include <X11/Xlib.h>
+#include <X11/Xutil.h>
+#include <X11/Xatom.h>
+#include <X11/cursorfont.h>
+#undef Window
+#endif
+
+/*
+ * Rectangles
+*/
+
 typedef struct Rectangle {
     int l, r, t, b;
 } Rectangle;
 
-
-typedef struct GlobalState {
-} GlobalState;
-
-GlobalState global;
 
 void print_rectangle(const char *prefix, Rectangle x) {
     fprintf(stderr, "%s: %d -> %d; %d -> %d\n", prefix, x.l, x.r, x.t, x.b);
@@ -43,25 +59,57 @@ bool rectangle_contains(Rectangle a, int x, int y);
 
 void string_copy(char **dst, size_t *ndst, const char *src, ptrdiff_t nsrc);
 
-int main() {
-    print_rectangle("make", rectangle_make(10, 20, 30, 40));
-    print_rectangle("intersection", rectangle_intersection(rectangle_make(10, 20, 30, 40), rectangle_make(15, 25, 35, 45))); // 15 20 35 40
-    print_rectangle("bounding", rectangle_bounding(rectangle_make(10, 20, 30, 40), rectangle_make(15, 25, 35, 45))); // 10 25 30 45
-    fprintf(stderr, "valid: %d\n", rectangle_valid(rectangle_make(10, 20, 30, 40))); // true
-    fprintf(stderr, "valid: %d\n", rectangle_valid(rectangle_make(20, 10, 30, 40))); // false
-    fprintf(stderr, "equals: %d\n", rectangle_equals(rectangle_make(10, 20, 30, 40), rectangle_make(10, 20, 30, 40))); // true
-    fprintf(stderr, "equals: %d\n", rectangle_equals(rectangle_make(10, 20, 30, 40), rectangle_make(15, 25, 35, 45))); // false
-    fprintf(stderr, "contains: %d\n", rectangle_contains(rectangle_make(10, 20, 30, 40), 15, 35)); // true
-    fprintf(stderr, "contains: %d\n", rectangle_contains(rectangle_make(10, 20, 30, 40), 25, 35)); // false
+/*
+ * Windows
+*/
 
-    char *dst = NULL;
-    size_t ndst = 0;
-    string_copy(&dst, &ndst, "Hello!", 6);
-    fprintf(stderr, "'%.*s'\n", (int) ndst, dst);
-    string_copy(&dst, &ndst, "World!", 6);
-    fprintf(stderr, "'%.*s'\n", (int) ndst, dst);
-    free(dst);
+typedef struct Window {
+    uint32_t *bits;
+    int width, height;
+
+#ifdef PLATFORM_WIN32
+    HWND hwnd;
+    bool trackingLeave;
+#endif
+
+#ifdef PLATFORM_LINUX
+    X11Window window;
+    XImage *image;
+#endif
+} Window;
+
+void initialise();
+Window *window_create(const char *title, int w, int h);
+int message_loop();
+
+/*
+ * Main
+*/
+
+typedef struct GlobalState {
+    Window **windows;
+    size_t window_count;
+
+#ifdef PLATFORM_LINUX
+    Display *display;
+    Visual *visual;
+    Atom window_closed_id;
+#endif
+} GlobalState;
+
+GlobalState global;
+
+
+int main() {
+    initialise();
+    window_create("Hello, World!", 300, 200);
+    window_create("Hello, Moon!", 300, 200);
+    return message_loop();
 }
+
+/*
+ * Implement Rectangle
+*/
 
 Rectangle rectangle_make(int l, int r, int t, int b) {
     Rectangle x;
@@ -105,3 +153,88 @@ void string_copy(char **dst, size_t *ndst, const char *src, ptrdiff_t nsrc) {
     *ndst = nsrc;
     memcpy(*dst, src, nsrc);
 }
+
+/*
+ * Implement Window
+*/
+
+#ifdef PLATFORM_WIN32
+
+// TODO: once I'm on Windows
+
+#endif
+
+#ifdef PLATFORM_LINUX
+
+Window *_find_window(X11Window window) {
+    for (uintptr_t i = 0; i < global.window_count; ++i) {
+        if (global.windows[i]->window == window) {
+            return global.windows[i];
+        }
+    }
+    return NULL;
+}
+
+Window *window_create(const char *title, int w, int h) {
+    Window *window = (Window *) calloc(1, sizeof(Window));
+    global.windows = realloc(global.windows, sizeof(Window *) * (++global.window_count));
+    global.windows[global.window_count-1] = window;
+
+    XSetWindowAttributes attributes = {};
+    window->window = XCreateWindow(global.display,
+                                   DefaultRootWindow(global.display),
+                                   0, 0, // origin
+                                   w, h,
+                                   0, 0, // border width, depth
+                                   InputOutput,
+                                   CopyFromParent,
+                                   CWOverrideRedirect,
+                                   &attributes);
+    XStoreName(global.display, window->window, title);
+    XSelectInput(global.display, window->window,
+                 SubstructureNotifyMask | ExposureMask | PointerMotionMask |
+                 ButtonPressMask | ButtonReleaseMask | KeyPressMask |
+                 KeyReleaseMask | StructureNotifyMask | EnterWindowMask |
+                 LeaveWindowMask | ButtonMotionMask | KeymapStateMask |
+                 FocusChangeMask | PropertyChangeMask);
+    XMapRaised(global.display, window->window);
+    XSetWMProtocols(global.display, window->window, &global.window_closed_id, 1 /* count */);
+    window->image = XCreateImage(global.display, global.visual,
+                                 24 /* depth */,
+                                 ZPixmap,
+                                 0 /* offset */,
+                                 NULL /* data */,
+                                 10, 10, 32, 0 /* width, height, bitmap_pad, bytes_per_line */);
+    return window;
+}
+
+int message_loop() {
+    while (true) {
+        XEvent event;
+        XNextEvent(global.display, &event);
+
+        if (event.type == ClientMessage && (Atom) event.xclient.data.l[0] == global.window_closed_id) {
+            return 0;
+        } else if (event.type == ConfigureNotify) {
+            Window *window = _find_window(event.xconfigure.window);
+            if (!window) continue;
+
+            if (window->width != event.xconfigure.width || window->height != event.xconfigure.height) {
+                window->width = event.xconfigure.width;
+                window->height = event.xconfigure.height;
+                window->image->width = window->width;
+                window->image->height = window->height;
+                window->image->bytes_per_line = window->width * 4;
+                window->image->data = (char *) window->bits;
+            }
+        }
+    }
+}
+
+void initialise() {
+    global.display = XOpenDisplay(NULL);
+    global.visual = XDefaultVisual(global.display, 0 /* screen number */);
+    global.window_closed_id = XInternAtom(global.display, "WM_DELETE_WINDOW", 0 /* only if exists */);
+}
+
+#endif
